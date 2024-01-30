@@ -111,6 +111,72 @@ static int dev_tty_poll(struct libos_handle* hdl, int in_events, int* out_events
     return -ENOSYS;
 }
 
+static ssize_t dev_checkpoint_write(struct libos_handle* hdl, const void* buf, size_t count) {
+    __UNUSED(hdl);
+
+    size_t i = 0;
+    while (i < count && buf[i] != '\0')
+        i++;
+
+    if (i == count)
+        return -EINVAL;
+
+    assert(buf[i] == '\0');
+
+    /* create new thread object from the current thread */
+    struct libos_thread* thread = get_new_thread();
+    if (!thread)
+        return -ENOMEM;
+
+    thread->tid = get_cur_thread()->tid;
+    thread->stack_top = get_cur_thread()->stack_top;
+    thread->stack_red = get_cur_thread()->stack_red;
+    thread->stack     = get_cur_thread()->stack;
+
+    libos_tcb_t libos_tcb = { 0 };
+    __libos_tcb_init(&libos_tcb);
+    libos_tcb.context.regs = get_cur_thread()->libos_tcb->context.regs;
+    libos_tcb.context.tls = tls;
+    thread->libos_tcb = &libos_tcb;
+
+    /* create new process object from the current process */
+    lock(&g_process.fs_lock);
+    rwlock_read_lock(&g_process_id_lock);
+    struct libos_process process_description = {
+        .pid = thread->tid,
+        .ppid = g_process.pid,
+        .pgid = g_process.pgid,
+        .sid = g_process.sid,
+        .root = g_process.root,
+        .cwd = g_process.cwd,
+        .umask = g_process.umask,
+        .exec = g_process.exec,
+    };
+    rwlock_read_unlock(&g_process_id_lock);
+
+    get_dentry(process_description.root);
+    get_dentry(process_description.cwd);
+    get_handle(process_description.exec);
+
+    unlock(&g_process.fs_lock);
+
+    INIT_LISTP(&process_description.children);
+    INIT_LISTP(&process_description.zombies);
+
+    clear_lock(&process_description.fs_lock);
+    clear_lock(&process_description.children_lock);
+
+    int ret = create_file_and_dump_checkpoint(buf, &migrate_fork, &process_description, thread);
+    thread->libos_tcb = NULL;
+
+    put_handle(process_description.exec);
+    put_dentry(process_description.cwd);
+    put_dentry(process_description.root);
+
+    put_thread(thread);
+    return ret < 0 ? ret : i; /* length of user-supplied filename; return just for sanity */
+}
+
 int init_devfs(void) {
     struct pseudo_node* root = pseudo_add_root_dir("dev");
 
@@ -161,6 +227,16 @@ int init_devfs(void) {
     tty->dev.dev_ops.write = &dev_tty_write;
     tty->dev.dev_ops.flush = &dev_tty_flush;
     tty->dev.dev_ops.poll = &dev_tty_poll;
+
+    /* to produce a checkpoint, app must write a null-terminated string with filename */
+    struct pseudo_node* checkpoint = pseudo_add_dev(root, "checkpoint");
+    checkpoint->perm = PSEUDO_PERM_FILE_RW;
+    checkpoint->dev.major = 10;
+    checkpoint->dev.minor = 0;
+    checkpoint->dev.dev_ops.read = &dev_null_read;
+    checkpoint->dev.dev_ops.write = &dev_checkpoint_write;
+    checkpoint->dev.dev_ops.seek = &dev_null_seek;
+    checkpoint->dev.dev_ops.truncate = &dev_null_truncate;
 
     struct pseudo_node* stdin = pseudo_add_link(root, "stdin", NULL);
     stdin->link.target = "/proc/self/fd/0";

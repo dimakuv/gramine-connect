@@ -755,3 +755,133 @@ out_fail:;
     bkeep_remove_tmp_vma(tmp_vma);
     return ret;
 }
+
+int create_file_and_dump_checkpoint(const char* filename, migrate_func_t migrate_func,
+                                    struct libos_process* process_description,
+                                    struct libos_thread* thread_description, ...) {
+    int ret;
+    struct libos_handle* hdl = NULL;
+    uintptr_t (*reserved_mem_ranges)[2] = NULL;
+
+    /* allocate a space for dumping the checkpoint data */
+    struct libos_cp_store cpstore = {
+        .alloc = cp_alloc,
+        .bound = CP_INIT_VMA_SIZE,
+    };
+
+    while (1) {
+        /* try allocating checkpoint; if allocation fails, try with smaller sizes */
+        cpstore.base = (uintptr_t)cp_alloc(0, cpstore.bound);
+        if (cpstore.base)
+            break;
+
+        cpstore.bound >>= 1;
+        if (cpstore.bound < ALLOC_ALIGNMENT)
+            break;
+    }
+
+    if (!cpstore.base) {
+        ret = -ENOMEM;
+        log_error("failed allocating enough memory for checkpoint");
+        goto out;
+    }
+
+    struct libos_ipc_ids process_ipc_ids = {
+        .self_vmid = g_process_ipc_ids.self_vmid,
+        .parent_vmid = g_process_ipc_ids.parent_vmid,
+        .leader_vmid = g_process_ipc_ids.leader_vmid,
+    };
+    va_list ap;
+    va_start(ap, thread_description);
+    ret = (*migrate_func)(&cpstore, process_description, thread_description, &process_ipc_ids, ap);
+    va_end(ap);
+    if (ret < 0) {
+        log_error("failed creating checkpoint: %s", unix_strerror(ret));
+        goto out;
+    }
+
+    log_debug("checkpoint of %lu bytes created", cpstore.offset);
+
+    struct checkpoint_hdr hdr;
+    memset(&hdr, 0, sizeof(hdr));
+
+    hdr.addr = (void*)cpstore.base;
+    hdr.size = cpstore.offset;
+
+    if (cpstore.mem_entries_cnt) {
+        hdr.mem_offset      = (uintptr_t)cpstore.first_mem_entry - cpstore.base;
+        hdr.mem_entries_cnt = cpstore.mem_entries_cnt;
+    }
+
+    if (cpstore.palhdl_entries_cnt) {
+        hdr.palhdl_offset      = (uintptr_t)cpstore.last_palhdl_entry - cpstore.base;
+        hdr.palhdl_entries_cnt = cpstore.palhdl_entries_cnt;
+    }
+
+    /* TODO: must save reserved_mem_ranges array in the file checkpoint (and restore in PAL) */
+    size_t reserved_mem_ranges_len = 0;
+    ret = create_mem_ranges_array(&cpstore, &reserved_mem_ranges, &reserved_mem_ranges_len);
+    if (ret < 0) {
+        log_error("creating reserved memory ranges failed: %s", unix_strerror(ret));
+        goto out;
+    }
+
+    struct libos_handle* hdl = get_new_handle();
+    if (!hdl) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    ret = open_namei(hdl, dir, filename, flags, mode, NULL);
+    if (ret < 0)
+        goto out;
+
+    ret = do_handle_write(hdl, &hdr, sizeof(hdr));
+    if (ret < 0) {
+        log_error("failed writing checkpoint header to file: %s", unix_strerror(ret));
+        goto out;
+    }
+
+    ret = send_checkpoint_on_stream(pal_process, &cpstore);
+    if (ret < 0) {
+        log_error("failed writing checkpoint: %s", unix_strerror(ret));
+        goto out;
+    }
+
+    ret = send_handles_on_stream(pal_process, &cpstore);
+    if (ret < 0) {
+        log_error("failed dumping PAL handles as part of checkpoint: %s",
+                  unix_strerror(ret));
+        goto out;
+    }
+
+    ret = 0;
+
+out:
+    if (cpstore.base) {
+        void* tmp_vma = NULL;
+        int tmp_ret = bkeep_munmap((void*)cpstore.base, cpstore.bound, /*is_internal=*/true,
+                                   &tmp_vma);
+        if (tmp_ret < 0) {
+            log_error("failed unmaping checkpoint: %s", unix_strerror(tmp_ret));
+            PalProcessExit(1);
+        }
+        if (PalVirtualMemoryFree((void*)cpstore.base, cpstore.bound) < 0) {
+            BUG();
+        }
+        bkeep_remove_tmp_vma(tmp_vma);
+    }
+
+    if (hdl)
+        put_handle(hdl);
+
+    if (reserved_mem_ranges)
+        free(reserved_mem_ranges);
+
+    if (ret < 0) {
+        log_error("file checkpoint creation failed");
+    }
+
+    return ret;
+}
+
